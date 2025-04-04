@@ -10,7 +10,7 @@ class UNetWithArgmax(nn.Module):
 
     def forward(self, x):
         logits = self.model(x)  # Output shape: (B, C, H, W)
-        pred = torch.argmax(logits, dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        pred = torch.argmax(logits, dim=1, keepdim=True).to(torch.int32)  # Shape: (B, 1, H, W), cast to int32
         pred = pred.permute(0, 2, 3, 1)  # Reorder to (B, H, W, 1)
         return pred
 
@@ -35,10 +35,11 @@ print(f"Dummy input shape: {dummy_input.shape}")
 with torch.no_grad():
     output = model(dummy_input)
     print(f"Model output shape (after argmax and reorder): {output.shape}")
+    print(f"Output dtype: {output.dtype}")
     print(f"Output min value: {output.min().item()}, max value: {output.max().item()}")
 
 # ─── Export to ONNX ──────────────────────────────────────────────────────────
-onnx_file = "unet_argmax_nhwc.onnx"
+onnx_file = "unet_argmax_nhwc_int32.onnx"
 print(f"Exporting model to {onnx_file}")
 torch.onnx.export(
     model,
