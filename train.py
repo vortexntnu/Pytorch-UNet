@@ -1,28 +1,33 @@
 import argparse
 import logging
 import os
-import random
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
 from pathlib import Path
 from torch import optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchvision import transforms
 
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
-dir_checkpoint = Path('./checkpoints/')
+from roboflow import Roboflow
+from utils.roboflow_dataloader import SemanticSegmentationDataset
+import datetime
 
+script_dir = Path(__file__).resolve().parent
+data_dir_base = script_dir / "data"
+base_checkpoint_dir = script_dir / 'checkpoints'
+
+run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S') # e.g., '20250622_175526'
+run_name = f'run_{run_timestamp}'
+
+dir_checkpoint = base_checkpoint_dir / run_name
+dir_checkpoint.mkdir(parents=True, exist_ok=True)
 
 def train_model(
         model,
@@ -30,8 +35,8 @@ def train_model(
         epochs: int = 5,
         batch_size: int = 1,
         learning_rate: float = 1e-5,
-        val_percent: float = 0.1,
         save_checkpoint: bool = True,
+        save_best: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
         weight_decay: float = 1e-8,
@@ -39,15 +44,18 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+    image_transform = transforms.Compose([
+        transforms.ToTensor(), # Scales to [0, 1] and converts to tensor
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Normalizes to [0, 1] with ImageNet stats
+    ])
 
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    train_set = SemanticSegmentationDataset(dir=data_dir_base / "train", image_transform=image_transform)
+    val_set = SemanticSegmentationDataset(dir=data_dir_base / "valid", image_transform=image_transform)
+
+    # 2. Check dataset sizes and calculate validation percentage
+    n_val = len(val_set)
+    n_train = len(train_set)
+    val_percent = n_val / (n_train + n_val)
 
     # 3. Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
@@ -74,17 +82,21 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    grad_scaler = torch.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
+    best_val_score = 0.0
+    epoch_val_count = 0
+    path_to_best_model = None
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
+        val_score_epoch = 0.0
+        epoch_val_count = 0
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
@@ -141,8 +153,11 @@ def train_model(
 
                         val_score = evaluate(model, val_loader, device, amp)
                         scheduler.step(val_score)
-
                         logging.info('Validation Dice score: {}'.format(val_score))
+
+                        val_score_epoch += val_score
+                        epoch_val_count += 1
+
                         try:
                             experiment.log({
                                 'learning rate': optimizer.param_groups[0]['lr'],
@@ -159,30 +174,61 @@ def train_model(
                         except:
                             pass
 
+        if save_best:
+
+            if epoch_val_count > 0:
+                mean_epoch_val = val_score_epoch / epoch_val_count
+            else:
+                continue
+
+            if mean_epoch_val > best_val_score:
+                best_val_score = mean_epoch_val
+
+                if path_to_best_model:
+                    try:
+                        path_to_best_model.unlink()
+                    except OSError as e:
+                        logging.error(f"Error removing old best model: {e}")
+
+                new_best_filename = f'best_model_epoch_{epoch}.pth'
+                path_to_best_model = dir_checkpoint / new_best_filename
+
+                Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                state_dict = model.state_dict()
+
+                state_dict['mask_values'] = train_set.mask_values
+                torch.save(state_dict, path_to_best_model)
+
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
-            state_dict['mask_values'] = dataset.mask_values
+            state_dict['mask_values'] = train_set.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
+    Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+    state_dict = model.state_dict()
+    state_dict['mask_values'] = train_set.mask_values
+    torch.save(state_dict, str(dir_checkpoint / 'model.pth'))
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=3, help='Number of epochs')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=10, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
-    parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
-                        help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
+    parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
+    parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
+    parser.add_argument('--simple', action='store_true', default=False, help='Use a smaller UNet')
+    parser.add_argument('--roboflow-api-key', type=str, default=None,)
+    parser.add_argument('--checkpoint', '-cp', action='store_true', default=False,)
+    parser.add_argument('--save-best', action='store_true', default=True,
+                        help='Save the best model found')
 
     return parser.parse_args()
-
 
 if __name__ == '__main__':
     args = get_args()
@@ -191,10 +237,19 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
+    roboflow_api_key = args.roboflow_api_key
+    if roboflow_api_key is None:
+        raise ValueError("Roboflow API key must be provided with --roboflow-api-key argument")
+    
+    rf = Roboflow(roboflow_api_key)
+    project = rf.workspace("pipe-92at4").project("pipeline-segmentation-nearby")
+    version = project.version(11)
+    dataset = version.download("png-mask-semantic", location=str(data_dir_base))
+
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=3, n_classes=args.classes, simple=args.simple, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -215,9 +270,10 @@ if __name__ == '__main__':
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
+            save_checkpoint=args.checkpoint,
+            save_best=args.save_best,
             device=device,
             img_scale=args.scale,
-            val_percent=args.val / 100,
             amp=args.amp
         )
     except torch.cuda.OutOfMemoryError:
@@ -231,8 +287,9 @@ if __name__ == '__main__':
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
+            save_checkpoint=args.checkpoint,
+            save_best=args.save_best,
             device=device,
             img_scale=args.scale,
-            val_percent=args.val / 100,
             amp=args.amp
         )
