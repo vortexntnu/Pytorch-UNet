@@ -112,7 +112,7 @@ if __name__ == '__main__':
     test_data_path = script_dir / args.test_dir
 
     run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S') # e.g., '20250622_175526'
-    run_name = f'run_{run_timestamp}'
+    run_name = f'test_{run_timestamp}'
 
     output_path = script_dir / args.output_dir / run_name
 
