@@ -88,15 +88,12 @@ def train_model(
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
     best_val_score = 0.0
-    epoch_val_count = 0
     path_to_best_model = None
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
-        val_score_epoch = 0.0
-        epoch_val_count = 0
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
@@ -139,65 +136,50 @@ def train_model(
                 })
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
-                # Evaluation round
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+        histograms = {}
+        for tag, value in model.named_parameters():
+            tag = tag.replace('/', '.')
+            if value.grad is not None: # Check if grad exists
+                if not (torch.isinf(value) | torch.isnan(value)).any():
+                    histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
+                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                    histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
-                        logging.info('Validation Dice score: {}'.format(val_score))
+        val_score = evaluate(model, val_loader, device, amp)
+        scheduler.step(val_score)
+        logging.info('Validation Dice score: {}'.format(val_score))
 
-                        val_score_epoch += val_score
-                        epoch_val_count += 1
-
-                        try:
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms
-                            })
-                        except:
-                            pass
-
+        try:
+            experiment.log({
+                'learning rate': optimizer.param_groups[0]['lr'],
+                'validation Dice': val_score,
+                'images': wandb.Image(images[0].cpu()),
+                'masks': {
+                    'true': wandb.Image(true_masks[0].float().cpu()),
+                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
+                },
+                'step': global_step,
+                'epoch': epoch,
+                **histograms
+            })
+        except Exception as e:
+            logging.warning(f"Could not log to wandb: {e}")
+            pass
+        
         if save_best:
-
-            if epoch_val_count > 0:
-                mean_epoch_val = val_score_epoch / epoch_val_count
-            else:
-                continue
-
-            if mean_epoch_val > best_val_score:
-                best_val_score = mean_epoch_val
-
+            if val_score > best_val_score:
+                best_val_score = val_score
                 if path_to_best_model:
                     try:
                         path_to_best_model.unlink()
                     except OSError as e:
                         logging.error(f"Error removing old best model: {e}")
-
-                new_best_filename = f'best_model_epoch_{epoch}.pth'
+                new_best_filename = f'best_model_epoch_{epoch}_val_{val_score:.4f}.pth'
                 path_to_best_model = dir_checkpoint / new_best_filename
-
-                Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
                 state_dict = model.state_dict()
-
                 state_dict['mask_values'] = train_set.mask_values
                 torch.save(state_dict, path_to_best_model)
+                logging.info(f"New best model saved at epoch {epoch} with validation score: {val_score}")
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -210,6 +192,7 @@ def train_model(
     state_dict = model.state_dict()
     state_dict['mask_values'] = train_set.mask_values
     torch.save(state_dict, str(dir_checkpoint / 'model.pth'))
+    logging.info('Final model saved.')
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
