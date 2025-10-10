@@ -1,10 +1,40 @@
 import argparse
 import logging
 import torch
-
+import torch.nn as nn
 from pathlib import Path
 
 from unet import UNet
+
+
+class OutputWrapper(nn.Module):
+    """Wraps the UNet model to add a post-processing operation before ONNX export."""
+    def __init__(self, model, output_type: str):
+        super().__init__()
+        self.model = model
+        self.output_type = output_type.lower()
+
+        valid_types = {'sigmoid', 'softmax', 'argmax', 'none'}
+        if self.output_type not in valid_types:
+            raise ValueError(f"Invalid output type '{output_type}'. Must be one of {valid_types}")
+
+    def forward(self, x):
+        x = self.model(x)
+
+        if self.output_type == 'sigmoid':
+            return torch.sigmoid(x).to(torch.float32)
+
+        elif self.output_type == 'softmax':
+            # Softmax along the class dimension (dim=1)
+            return torch.softmax(x, dim=1).to(torch.float32)
+
+        elif self.output_type == 'argmax':
+            # Argmax along the class dimension, output int32 tensor
+            return torch.argmax(x, dim=1, keepdim=True).to(torch.int32)
+
+        # No change to raw logits
+        return x
+
 
 def get_args():
     """Parses command-line arguments for the export script."""
@@ -14,9 +44,9 @@ def get_args():
     parser.add_argument('--model-path', '-m', required=True, type=str,
                         help='Absolute path to the trained PyTorch model (.pth file)')
     parser.add_argument('--output-name', '-o', required=True, type=str,
-                        help='name of the exported ONNX model (.onnx file)')
+                        help='Name of the exported ONNX model (.onnx file)')
     
-    # --- Model Architecture Arguments (Must match the trained model) ---
+    # --- Model Architecture Arguments ---
     parser.add_argument('--classes', '-c', type=int, default=1,
                         help='Number of output classes for the model')
     parser.add_argument('--bilinear', action='store_true', default=False,
@@ -30,36 +60,37 @@ def get_args():
     parser.add_argument('--width', type=int, default=660,
                         help='The input image width for the ONNX model graph')
 
+    # --- Output type selection ---
+    parser.add_argument('--network-output-type', '-t', type=str, default='none',
+                        choices=['sigmoid', 'softmax', 'argmax', 'none'],
+                        help='Post-processing operation to apply before export. '
+                             'Choices: sigmoid, softmax, argmax, none')
+
     return parser.parse_args()
 
+
 def export_model_to_onnx(args):
-    """
-    Loads a trained U-Net model, and exports it to the ONNX format.
-    """
+    """Loads a trained U-Net model, applies post-processing, and exports it to ONNX format."""
     logging.info("Starting model export to ONNX...")
 
     # 1. Set up the device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device: {device}')
 
-    # 2. Instantiate the U-Net model with the correct architecture
-    # The parameters (n_channels, n_classes, bilinear, simple) must match the
-    # model that was trained to load the weights correctly.
-    n_channels = 3  # Assuming RGB input images
-    net = UNet(n_channels=n_channels, n_classes=args.classes, bilinear=args.bilinear, simple=args.simple)
+    # 2. Instantiate the U-Net
+    n_channels = 3  # RGB
+    net = UNet(n_channels=n_channels, n_classes=args.classes,
+               bilinear=args.bilinear, simple=args.simple)
+    net = net.to(memory_format=torch.channels_last) 
     logging.info(f"Instantiated U-Net with {n_channels} input channels and {args.classes} output classes.")
 
-    # 3. Load the trained weights from the .pth file
+    # 3. Load the trained weights
     try:
         logging.info(f"Loading model state from {args.model_path}")
         state_dict = torch.load(args.model_path, map_location=device)
-        
-        # The training script might save extra keys (like 'mask_values').
-        # We remove it here to ensure compatibility with model.load_state_dict().
         if 'mask_values' in state_dict:
             del state_dict['mask_values']
             logging.info("Removed 'mask_values' key from state dictionary.")
-            
         net.load_state_dict(state_dict)
         logging.info("Model weights loaded successfully.")
     except FileNotFoundError:
@@ -68,49 +99,47 @@ def export_model_to_onnx(args):
     except Exception as e:
         logging.error(f"An error occurred while loading the model: {e}")
         return
-        
-    # 4. Set the model to evaluation mode
-    # This is a crucial step to disable dropout and batch normalization layers' training behavior.
-    net.eval()
-    net.to(device)
-    logging.info("Model set to evaluation mode.")
 
-    # 5. Create a dummy input tensor
-    # ONNX export requires a sample input to trace the model's execution path.
-    # The dimensions should match what the model expects for a single inference.
-    batch_size = 1 # ONNX models are typically exported with a batch size of 1
-    dummy_input = torch.randn(batch_size, n_channels, args.height, args.width, requires_grad=True).to(device)
-    logging.info(f"Created a dummy input tensor of shape: {dummy_input.shape}")
+    # 4. Wrap model with post-processing
+    wrapped_model = OutputWrapper(net, args.network_output_type)
+    wrapped_model.to(device)
+    wrapped_model.eval()
 
-    # 6. Export the model to ONNX
+    # 5. Create dummy input
+    dummy_input = torch.randn(1, n_channels, args.height, args.width, requires_grad=False).to(device)
+    logging.info(f"Created dummy input tensor of shape: {dummy_input.shape}")
+    dummy_input = dummy_input.to(memory_format=torch.channels_last, device=device)
+    logging.info("Dummy input tensor moved to device and memory format set.")
+    logging.info(f"dummy_input shape after memory format change: {dummy_input.shape}")
+    # 6. Export to ONNX
     output_path = Path(args.output_name)
-    # # Ensure the output directory exists
-    # output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logging.info(f"Exporting model to {output_path}...")
+    logging.info(f"Exporting model with '{args.network_output_type}' output type to {output_path}...")
+
     try:
         torch.onnx.export(
-            net,                          # The model to be exported
-            dummy_input,                  # A sample input to trace the graph
-            str(output_path),             # Where to save the model
-            export_params=True,           # Store the trained weights in the model file
-            opset_version=11,             # The ONNX version to export the model to
-            do_constant_folding=True,     # Whether to execute constant folding for optimization
-            input_names=['input'],        # The model's input names
-            output_names=['output'],      # The model's output names
-            dynamic_axes={'input': {0: 'batch_size', 2: 'height', 3: 'width'},    # Dynamic axes for flexible input sizes
-                          'output': {0: 'batch_size', 2: 'height', 3: 'width'}}
+            wrapped_model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=11,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size', 2: 'height', 3: 'width'},
+                'output': {0: 'batch_size', 2: 'height', 3: 'width'}
+            }
         )
-        logging.info("Model successfully exported to ONNX.")
-        logging.info(f"You can now use '{output_path}' for inference with TensorRT or other ONNX runtimes.")
 
+        logging.info(f"Model successfully exported to {output_path}")
+        logging.info(f"Output type: {args.network_output_type}")
     except Exception as e:
         logging.error(f"An error occurred during ONNX export: {e}")
 
+
 if __name__ == '__main__':
-    # Set up basic logging
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    
-    # Parse arguments and run the export function
     args = get_args()
     export_model_to_onnx(args)
