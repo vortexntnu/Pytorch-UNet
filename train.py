@@ -29,6 +29,37 @@ run_name = f'run_{run_timestamp}'
 dir_checkpoint = base_checkpoint_dir / run_name
 dir_checkpoint.mkdir(parents=True, exist_ok=True)
 
+class ResizeWithAspectRatio:
+    """
+    Resize image (and optionally mask) to target size while maintaining aspect ratio.
+    Pads with zeros (black) to fit the exact size.
+    """
+    def __init__(self, target_size=(384, 384), interpolation=transforms.InterpolationMode.BILINEAR):
+        self.target_size = target_size
+        self.interpolation = interpolation
+
+    def __call__(self, img):
+        w, h = img.size
+        target_w, target_h = self.target_size
+
+        scale = min(target_w / w, target_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = transforms.functional.resize(img, (new_h, new_w), self.interpolation)
+
+        # Create a black canvas and paste the resized image centered
+        new_img = transforms.functional.pad(
+            resized,
+            padding=(
+                (target_w - new_w) // 2,
+                (target_h - new_h) // 2,
+                target_w - new_w - (target_w - new_w) // 2,
+                target_h - new_h - (target_h - new_h) // 2
+            ),
+            fill=0
+        )
+        return new_img
+
+
 def train_model(
         model,
         device,
@@ -42,15 +73,24 @@ def train_model(
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        img_width: int = 320,
+        img_height: int = 240,
 ):
-    # 1. Create dataset
+    target_resolution = (img_height, img_width)
+
     image_transform = transforms.Compose([
-        transforms.ToTensor(), # Scales to [0, 1] and converts to tensor
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Normalizes to [0, 1] with ImageNet stats
+        ResizeWithAspectRatio(target_size=target_resolution,
+                            interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
     ])
 
-    train_set = SemanticSegmentationDataset(dir=data_dir_base / "train", image_transform=image_transform)
-    val_set = SemanticSegmentationDataset(dir=data_dir_base / "valid", image_transform=image_transform)
+    mask_transform = ResizeWithAspectRatio(target_size=target_resolution,
+                                        interpolation=transforms.InterpolationMode.NEAREST)
+
+    train_set = SemanticSegmentationDataset(dir=data_dir_base / "train", image_transform=image_transform, mask_transform=mask_transform)
+    val_set = SemanticSegmentationDataset(dir=data_dir_base / "valid", image_transform=image_transform, mask_transform=mask_transform)
 
     # 2. Check dataset sizes and calculate validation percentage
     n_val = len(val_set)
@@ -196,16 +236,18 @@ def train_model(
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=3, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=10, help='Batch size')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=10, help='Number of epochs')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=16, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
+    parser.add_argument('--img-width', '-W', metavar='WIDTH', type=int, default=320, help='Image width')
+    parser.add_argument('--img-height', '-H', metavar='HEIGHT', type=int, default=240, help='Image height')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
-    parser.add_argument('--simple', action='store_true', default=False, help='Use a smaller UNet')
+    parser.add_argument('--simple', action='store_true', default=True, help='Use a smaller UNet')
     parser.add_argument('--roboflow-api-key', type=str, default=None,)
     parser.add_argument('--checkpoint', '-cp', action='store_true', default=False,)
     parser.add_argument('--save-best', action='store_true', default=True,
@@ -224,9 +266,10 @@ if __name__ == '__main__':
     if roboflow_api_key is None:
         raise ValueError("Roboflow API key must be provided with --roboflow-api-key argument")
     
+
     rf = Roboflow(roboflow_api_key)
-    project = rf.workspace("pipe-92at4").project("pipeline-segmentation-nearby")
-    version = project.version(11)
+    project = rf.workspace("hei-qp1ee").project("lang-gul")
+    version = project.version(2)
     dataset = version.download("png-mask-semantic", location=str(data_dir_base))
 
     # Change here to adapt to your data
@@ -257,7 +300,9 @@ if __name__ == '__main__':
             save_best=args.save_best,
             device=device,
             img_scale=args.scale,
-            amp=args.amp
+            amp=args.amp,
+            img_width=args.img_width,
+            img_height=args.img_height
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '

@@ -48,17 +48,20 @@ class SemanticSegmentationDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-
         image = Image.open(self.images[idx]).convert("RGB")
         mask = Image.open(self.masks[idx]).convert("L")
-        mask = torch.as_tensor(np.array(mask), dtype=torch.int64)
 
+        # Apply transforms on PIL Images first
         if self.image_transform:
             image = self.image_transform(image)
-        
+            
         if self.mask_transform:
             mask = self.mask_transform(mask)
-  
+
+        # Then convert mask to tensor
+        mask = torch.as_tensor(np.array(mask), dtype=torch.int64)
+
         return {'image': image, 'mask': mask}
+
     
 

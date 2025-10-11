@@ -46,18 +46,41 @@ def blend_image_and_mask(original_image, mask_array, color, alpha=0.4):
     
     return blended_image.convert("RGB")
 
+class ResizeIfLargerKeepAspect:
+    """
+    Downscale a PIL image only if it's larger than the target size,
+    preserving aspect ratio. Never upscales.
+    """
+    def __init__(self, max_width, max_height, interpolation=transforms.InterpolationMode.BILINEAR):
+        self.max_width = max_width
+        self.max_height = max_height
+        self.interpolation = interpolation
+
+    def __call__(self, img):
+        w, h = img.size
+
+        # Only downscale if image exceeds limits
+        if w > self.max_width or h > self.max_height:
+            scale = min(self.max_width / w, self.max_height / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = transforms.functional.resize(img, (new_h, new_w), interpolation=self.interpolation)
+        return img
+
+
 
 class UnetSegmentationNode(Node):
 
     def __init__(self):
         super().__init__('unet_segmentation_node')
 
-        self.declare_parameter('model_path', '/home/jorgen/deep/Pytorch-UNet/checkpoints/run_20250622_194023/model.pth')
-        self.declare_parameter('input_topic', '/gripper_camera/image_raw')
+        self.declare_parameter('model_path', '/home/jorgen/deep/Pytorch-UNet/checkpoints/run_20251011_212141/best_model_epoch_15_val_0.9756.pth')
+        self.declare_parameter('input_topic', '/image_color')
         self.declare_parameter('output_topic', '/image_masked')
+        self.declare_parameter('resize_width', 320)
+        self.declare_parameter('resize_height', 240)
         self.declare_parameter('mask_threshold', 0.5)
         self.declare_parameter('bilinear', False)
-        self.declare_parameter('simple', False)
+        self.declare_parameter('simple', True)
         self.declare_parameter('classes', 1)
         self.declare_parameter('device', 'cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -69,6 +92,9 @@ class UnetSegmentationNode(Node):
         self.simple = self.get_parameter('simple').get_parameter_value().bool_value
         self.n_classes = self.get_parameter('classes').get_parameter_value().integer_value
         self.device_name = self.get_parameter('device').get_parameter_value().string_value
+        self.resize_width = self.get_parameter('resize_width').get_parameter_value().integer_value
+        self.resize_height = self.get_parameter('resize_height').get_parameter_value().integer_value
+
         
         if not self.model_path:
             self.get_logger().fatal("Parameter 'model_path' is not set. Please provide the absolute path to the model.")
@@ -79,10 +105,15 @@ class UnetSegmentationNode(Node):
         self.PRED_COLOR = (255, 0, 0) # Red for prediction
 
         self.net = self.load_model()
-        
+
         self.image_transforms = transforms.Compose([
+            ResizeIfLargerKeepAspect(
+                max_width=self.resize_width,
+                max_height=self.resize_height
+            ),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
         ])
 
         qos_profile = QoSProfile(
@@ -119,34 +150,56 @@ class UnetSegmentationNode(Node):
             exit()
             
     def image_callback(self, msg):
-        """
-        Callback function for the image subscriber.
-        """
         try:
+            # --- Convert ROS image to OpenCV ---
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            
             frame_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
             pil_img = PILImage.fromarray(frame_rgb)
-            
-            image_tensor = self.image_transforms(pil_img)
-            
+
+            # --- Resize input (keep aspect ratio, downscale only) ---
+            resize_transform = ResizeIfLargerKeepAspect(
+                max_width=self.resize_width,
+                max_height=self.resize_height
+            )
+            resized_pil = resize_transform(pil_img)
+            resized_w, resized_h = resized_pil.size
+
+            # --- Preprocess for model ---
+            image_tensor = self.image_transforms(resized_pil)
+
+            # --- Run model prediction ---
             predicted_mask_np = predict_mask(
                 net=self.net,
                 image_tensor=image_tensor,
                 device=self.device,
                 out_threshold=self.mask_threshold
             )
-            
-            blended_img = blend_image_and_mask(pil_img, predicted_mask_np, color=self.PRED_COLOR)
-            
-            blended_frame_rgb = np.array(blended_img)
-            
-            output_msg = self.bridge.cv2_to_imgmsg(blended_frame_rgb, "rgb8")
+
+            # --- Convert mask to color overlay (same size as model input) ---
+            mask_rgb = np.zeros((resized_h, resized_w, 3), dtype=np.uint8)
+            mask_rgb[predicted_mask_np == 1] = self.PRED_COLOR
+
+            # Blend resized image + mask overlay
+            base_np = np.array(resized_pil)
+            blended_np = cv2.addWeighted(base_np, 1.0, mask_rgb, 0.4, 0)
+
+            # --- Create side-by-side composite ---
+            combined_np = np.concatenate((base_np, blended_np), axis=1)
+
+            # --- Publish combined image ---
+            output_msg = self.bridge.cv2_to_imgmsg(combined_np, "rgb8")
             output_msg.header = msg.header
             self.publisher.publish(output_msg)
 
+            # Optional debug
+            self.get_logger().debug(
+                f"Published visualization {resized_w}x{resized_h}, "
+                f"original {pil_img.width}x{pil_img.height}"
+            )
+
         except Exception as e:
             self.get_logger().error(f'Failed to process image: {e}')
+
 
 
 def main(args=None):
